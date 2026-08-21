@@ -1,0 +1,67 @@
+{
+  "sources": [
+    {
+      "doc_id": "who_htn_pharmacological_zh_2021",
+      "filename": "WHO_成人高血压药物治疗指南_中文版.pdf",
+      "title": "成人高血压药物治疗指南",
+      "publisher": "World Health Organization",
+      "year": 2021,
+      "language": "zh",
+      "source_type": "guideline",
+      "diseases": [
+        "高血压"
+      ],
+      "topics": [
+        "药物治疗",
+        "血压控制",
+        "随访"
+      ],
+      "source_url": "https://www.who.int/publications/i/item/9789240033986",
+      "authority_level": 5,
+      "enabled": true
+    },
+    {
+      "doc_id": "who_hearts_lifestyle_2018",
+      "filename": "WHO_HEARTS_健康生活方式咨询.pdf",
+      "title": "HEARTS: Healthy-lifestyle counselling",
+      "publisher": "World Health Organization",
+      "year": 2018,
+      "language": "en",
+      "source_type": "guideline",
+      "diseases": [
+        "高血压",
+        "心血管疾病"
+      ],
+      "topics": [
+        "生活方式",
+        "饮食",
+        "运动",
+        "戒烟",
+        "限酒"
+      ],
+      "source_url": "https://www.who.int/publications/i/item/WHO-NMH-NVI-18-1",
+      "authority_level": 5,
+      "enabled": true
+    },
+    {
+      "doc_id": "who_hearts_protocols_2018",
+      "filename": "WHO_HEARTS_循证治疗方案.pdf",
+      "title": "HEARTS: Evidence-based treatment protocols",
+      "publisher": "World Health Organization",
+      "year": 2018,
+      "language": "en",
+      "source_type": "guideline",
+      "diseases": [
+        "高血压",
+        "糖尿病"
+      ],
+      "topics": [
+        "治疗方案",
+        "慢病管理"
+      ],
+      "source_url": "https://www.who.int/publications/i/item/WHO-NMH-NVI-18-2",
+      "authority_level": 5,
+      "enabled": true
+    }
+  ]
+}

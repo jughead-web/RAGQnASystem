@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from kg_client import KGClient, build_attribute_prompt, build_relation_prompt
-
+from evidence import Evidence
 
 # ---------------------------------------------------------------------- spec
 
@@ -129,3 +129,112 @@ def execute_intents(
             prompt_parts.append(build_relation_prompt(entity, "药品生产商", items))
         # 未知 query_kind 静默跳过，不抛异常
     return "".join(prompt_parts), intent_names
+def execute_intents_with_evidence(
+    response: str,
+    entities: Dict[str, str],
+    kg: KGClient,
+) -> Tuple[List[str], List[Evidence]]:
+    """
+    新版意图执行函数。
+
+    与旧 execute_intents 最大区别：
+
+    旧版：
+        KG结果 -> 拼接 <提示>
+
+    新版：
+        KG结果 -> Evidence
+
+    只有真正查询到数据时才产生 Evidence。
+    """
+
+    intent_names: List[str] = []
+    evidence_list: List[Evidence] = []
+
+    specs = route_intents(response)
+
+    for spec in specs:
+
+        intent_names.append(spec.intent_name)
+
+        entity = entities.get(spec.entity_key)
+
+        # 意图识别成功，但没有实体
+        if not entity:
+            continue
+
+        # ----------------------------------------------------------
+        # 1. 查询疾病属性
+        # ----------------------------------------------------------
+        if spec.query_kind == "attribute":
+
+            value = kg.get_disease_attribute(
+                entity,
+                spec.arg,
+            )
+
+            # 没数据就不创建证据
+            if not value:
+                continue
+
+            evidence_list.append(
+                Evidence(
+                    source_type="kg",
+                    title="Neo4j 医疗知识图谱",
+                    entity=entity,
+                    relation=spec.arg,
+                    content=str(value),
+                    note=f"由意图「{spec.intent_name}」检索得到",
+                )
+            )
+
+        # ----------------------------------------------------------
+        # 2. 疾病关系查询
+        # ----------------------------------------------------------
+        elif spec.query_kind == "relation":
+
+            if spec.target_label is None:
+                continue
+
+            items = kg.get_related_entities(
+                entity,
+                spec.arg,
+                spec.target_label,
+            )
+
+            if not items:
+                continue
+
+            evidence_list.append(
+                Evidence(
+                    source_type="kg",
+                    title="Neo4j 医疗知识图谱",
+                    entity=entity,
+                    relation=spec.arg,
+                    content="、".join(items),
+                    note=f"由意图「{spec.intent_name}」检索得到",
+                )
+            )
+
+        # ----------------------------------------------------------
+        # 3. 药物生产商
+        # ----------------------------------------------------------
+        elif spec.query_kind == "drug_producer":
+
+            items = kg.get_drug_producers(entity)
+
+            if not items:
+                continue
+
+            evidence_list.append(
+                Evidence(
+                    source_type="kg",
+                    title="Neo4j 医疗知识图谱",
+                    entity=entity,
+                    relation="药品生产商",
+                    content="、".join(items),
+                    note=f"由意图「{spec.intent_name}」检索得到",
+                )
+            )
+
+    return intent_names, evidence_list

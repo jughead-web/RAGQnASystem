@@ -1,5 +1,62 @@
-neo4j-community-5.18.1/
-model/chinese-roberta-wwm-ext/
-model/best_roberta_rnn_model_ent_aug.pt
+# ======================
+# Python
+# ======================
 __pycache__/
+*.pyc
+
+
+# ======================
+# Environment
+# ======================
+.env
+.venv/
+
+
+# ======================
+# Models
+# ======================
+model/
+*.pt
+*.pth
+*.bin
+*.onnx
+
+
+# ======================
+# Vector Database
+# ======================
+qdrant_storage/
+
+
+# ======================
+# Medical Documents
+# ======================
+medical_docs/
+
+
+# ======================
+# Runtime Data
+# ======================
+tmp_data/
+
+
+# ======================
+# Neo4j
+# ======================
+neo4j-community-5.18.1/
+
+
+# ======================
+# Tests
+# ======================
 tests/
+
+
+# ======================
+# Cache
+# ======================
+.cache/
+
+# Test medical data
+case_memory/*.json
+semantic_memory/*.json

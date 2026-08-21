@@ -8,7 +8,9 @@ import torch
 import py2neo
 import random
 import re
+import json
 import logging
+
 from typing import Dict, List, Tuple
 
 from config import settings
@@ -18,10 +20,165 @@ from kg_client import (
     build_attribute_prompt,
     build_relation_prompt,
 )
-from intent_router import execute_intents
+from intent_router import execute_intents_with_evidence
+
+from evidence import (
+    Evidence,
+    build_grounded_prompt,
+)
+
+from context_resolver import (
+    is_source_query,
+    get_last_assistant_turn,
+    format_evidence_answer,
+    resolve_followup_query,
+)
+
+from kg_answer_formatter import (
+    is_pure_kg_evidence,
+    format_kg_answer,
+)
+
+from vector_rag import VectorRetriever
+from medical_agent import MedicalAgent
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+
+@st.cache_resource
+def load_vector_retriever():
+
+    try:
+        return VectorRetriever()
+
+    except RuntimeError as e:
+
+        if "already accessed" in str(e):
+
+            st.warning(
+                "Vector RAG 已由 Medical Agent 加载，跳过重复初始化"
+            )
+
+            return None
+
+        raise e
+
+
+@st.cache_resource
+def load_medical_agent():
+    """
+    加载 Multi-Memory Medical Agent
+    """
+    return MedicalAgent(
+        model=settings.OLLAMA_QWEN_MODEL
+    )
+
+
+# ======================================================================
+# Retrieval Router V2
+# ======================================================================
+
+VECTOR_FORCE_HINTS = (
+    "控制目标",
+    "血压目标",
+    "目标血压",
+    "目标值",
+    "达标值",
+    "达标标准",
+    "控制标准",
+    "指南怎么说",
+    "指南推荐",
+    "指南建议",
+    "推荐标准",
+    "推荐目标",
+    "随访",
+    "复查",
+    "多久复查",
+    "多久随访",
+    "监测频率",
+    "随访频率",
+    "治疗后",
+    "开始药物治疗后",
+)
+
+HYBRID_HINTS = (
+    "为什么",
+    "为什么需要",
+    "原理",
+    "机制",
+    "长期",
+    "生活方式",
+    "如何改善",
+    "怎么改善",
+    "注意事项",
+    "有什么影响",
+    "如何理解",
+    "解释一下",
+    "怎么回事",
+    "如何管理",
+    "怎么管理",
+)
+
+
+def decide_retrieval_mode_v2(
+    query: str,
+    kg_evidence: List[Evidence],
+) -> Tuple[str, str]:
+    """
+    返回:
+        (retrieval_mode, reason)
+
+    retrieval_mode:
+        KG
+        VECTOR
+        HYBRID
+    """
+    text = (query or "").strip()
+
+    force_hits = [
+        hint
+        for hint in VECTOR_FORCE_HINTS
+        if hint in text
+    ]
+
+    if force_hits:
+        return (
+            "VECTOR",
+            "命中规范/目标类关键词: "
+            + "、".join(force_hits),
+        )
+
+    hybrid_hits = [
+        hint
+        for hint in HYBRID_HINTS
+        if hint in text
+    ]
+
+    if hybrid_hits:
+        if kg_evidence:
+            return (
+                "HYBRID",
+                "命中解释型关键词且存在 KG 证据: "
+                + "、".join(hybrid_hits),
+            )
+
+        return (
+            "VECTOR",
+            "命中解释型关键词且 KG 无直接证据: "
+            + "、".join(hybrid_hits),
+        )
+
+    if kg_evidence:
+        return (
+            "KG",
+            "存在结构化 KG 证据，按事实型查询处理",
+        )
+
+    return (
+        "VECTOR",
+        "KG 未命中有效证据，回退到文档向量检索",
+    )
 
 
 
@@ -46,7 +203,8 @@ def load_model(cache_model: str):
     bert_tokenizer = BertTokenizer.from_pretrained(model_name)
     bert_model = ner.Bert_Model(model_name, hidden_size=128, tag_num=len(tag2idx), bi=True)
     bert_model.load_state_dict(torch.load(
-        os.path.join(settings.MODEL_DIR, f'{cache_model}.pt')
+        os.path.join(settings.MODEL_DIR, f'{cache_model}.pt'),
+        map_location=device
     ))
     bert_model = bert_model.to(device)
     bert_model.eval()
@@ -54,88 +212,208 @@ def load_model(cache_model: str):
 
 
 
-def Intent_Recognition(query: str, choice: str) -> str:
-    """调用 ollama 上的 LLM 做意图识别，返回 LLM 原始文本输出。
-
-    :param query: 用户问题
-    :param choice: ollama 模型名称
-    :return: LLM 输出文本，期望包含「查询XX」格式的意图标签列表，由
-             :func:`intent_router.execute_intents` 解析。
+def Intent_Recognition(
+    query: str,
+    choice: str,
+) -> str:
     """
+    稳定版意图识别：规则优先，LLM 只做兜底。
+
+    这样可以保证：
+    - “高血压的症状”这类明确问题不再依赖 7B 模型随机分类；
+    - 开放式解释问题不强行塞进 KG 意图；
+    - 多意图问题仍可识别；
+    - 返回值保持为 JSON 数组字符串，兼容 intent_router.route_intents().
+    """
+
+    allowed_intents = [
+        "查询疾病简介",
+        "查询疾病病因",
+        "查询疾病预防措施",
+        "查询疾病治疗周期",
+        "查询治愈概率",
+        "查询疾病易感人群",
+        "查询疾病所需药品",
+        "查询疾病宜吃食物",
+        "查询疾病忌吃食物",
+        "查询疾病所需检查项目",
+        "查询疾病所属科目",
+        "查询疾病的症状",
+        "查询疾病的治疗方法",
+        "查询疾病的并发疾病",
+        "查询药品的生产商",
+    ]
+
+    q = query.strip()
+    matched: List[str] = []
+
+    def add(intent: str) -> None:
+        if intent not in matched:
+            matched.append(intent)
+
+    # --------------------------------------------------------------
+    # A. 明确、可确定的 KG 意图：规则优先
+    # --------------------------------------------------------------
+    rule_groups = [
+        (
+            ["症状", "什么表现", "有哪些表现", "临床表现"],
+            "查询疾病的症状",
+        ),
+        (
+            ["怎么治疗", "如何治疗", "怎么治", "治疗方法", "如何医治"],
+            "查询疾病的治疗方法",
+        ),
+        (
+            ["吃什么药", "用什么药", "使用什么药", "有哪些药", "什么药", "药品有哪些", "需要哪些药"],
+            "查询疾病所需药品",
+        ),
+        (
+            ["做什么检查", "需要什么检查", "检查项目", "需要检查", "怎么检查"],
+            "查询疾病所需检查项目",
+        ),
+        (
+            ["怎么预防", "如何预防", "预防措施"],
+            "查询疾病预防措施",
+        ),
+        (
+            ["治疗周期", "多久能治", "治疗多久"],
+            "查询疾病治疗周期",
+        ),
+        (
+            ["治愈概率", "能治好吗", "治愈率", "能不能治好"],
+            "查询治愈概率",
+        ),
+        (
+            ["易感人群", "哪些人容易得", "什么人容易得"],
+            "查询疾病易感人群",
+        ),
+        (
+            ["宜吃", "适合吃什么", "吃什么好"],
+            "查询疾病宜吃食物",
+        ),
+        (
+            ["忌吃", "不能吃什么", "不宜吃什么"],
+            "查询疾病忌吃食物",
+        ),
+        (
+            ["属于什么科", "挂什么科", "所属科目", "哪个科"],
+            "查询疾病所属科目",
+        ),
+        (
+            ["并发症", "并发疾病", "会引起什么病"],
+            "查询疾病的并发疾病",
+        ),
+        (
+            ["生产商", "哪个公司生产", "哪家生产"],
+            "查询药品的生产商",
+        ),
+        (
+            ["疾病简介", "介绍一下", "是什么病", "什么是"],
+            "查询疾病简介",
+        ),
+    ]
+
+    for keywords, intent in rule_groups:
+        if any(keyword in q for keyword in keywords):
+            add(intent)
+
+    # “病因/原因”必须更谨慎，避免把
+    # “为什么需要长期生活方式干预”误判成疾病病因。
+    cause_patterns = [
+        "病因",
+        "什么原因引起",
+        "什么原因导致",
+        "为什么会得",
+        "为什么会患",
+        "怎么引起的",
+        "如何引起",
+        "发病原因",
+    ]
+    if any(pattern in q for pattern in cause_patterns):
+        add("查询疾病病因")
+
+    # 规则已经明确识别到意图时，直接返回，不调用 LLM。
+    if matched:
+        result = json.dumps(
+            matched[:3],
+            ensure_ascii=False,
+        )
+        logger.debug(
+            "规则意图识别结果: %s",
+            result,
+        )
+        return result
+
+    # --------------------------------------------------------------
+    # B. 规则无法确定时，才让 LLM 做兜底分类
+    # --------------------------------------------------------------
     prompt = f"""
-阅读下列提示，回答问题（问题在输入的最后）:
-当你试图识别用户问题中的查询意图时，你需要仔细分析问题，并在16个预定义的查询类别中一一进行判断。对于每一个类别，思考用户的问题是否含有与该类别对应的意图。如果判断用户的问题符合某个特定类别，就将该类别加入到输出列表中。这样的方法要求你对每一个可能的查询意图进行系统性的考虑和评估，确保没有遗漏任何一个可能的分类。
+你是一个医疗知识图谱查询意图分类器。
 
-**查询类别**
-- "查询疾病简介"
-- "查询疾病病因"
-- "查询疾病预防措施"
-- "查询疾病治疗周期"
-- "查询治愈概率"
-- "查询疾病易感人群"
-- "查询疾病所需药品"
-- "查询疾病宜吃食物"
-- "查询疾病忌吃食物"
-- "查询疾病所需检查项目"
-- "查询疾病所属科目"
-- "查询疾病的症状"
-- "查询疾病的治疗方法"
-- "查询疾病的并发疾病"
-- "查询药品的生产商"
+你只做分类，不回答医学问题。
 
-在处理用户的问题时，请按照以下步骤操作：
-- 仔细阅读用户的问题。
-- 对照上述查询类别列表，依次考虑每个类别是否与用户问题相关。
-- 如果用户问题明确或隐含地包含了某个类别的查询意图，请将该类别的描述添加到输出列表中。
-- 确保最终的输出列表包含了所有与用户问题相关的类别描述。
+允许的意图：
+{json.dumps(allowed_intents, ensure_ascii=False)}
 
-以下是一些含有隐晦性意图的例子，每个例子都采用了输入和输出格式，并包含了对你进行思维链形成的提示：
-**示例1：**
-输入："睡眠不好，这是为什么？"
-输出：["查询疾病简介","查询疾病病因"]  # 这个问题隐含地询问了睡眠不好的病因
-**示例2：**
-输入："感冒了，怎么办才好？"
-输出：["查询疾病简介","查询疾病所需药品", "查询疾病的治疗方法"]  # 用户可能既想知道应该吃哪些药品，也想了解治疗方法
-**示例3：**
-输入："跑步后膝盖痛，需要吃点什么？"
-输出：["查询疾病简介","查询疾病宜吃食物", "查询疾病所需药品"]  # 这个问题可能既询问宜吃的食物，也可能在询问所需药品
-**示例4：**
-输入："我怎样才能避免冬天的流感和感冒？"
-输出：["查询疾病简介","查询疾病预防措施"]  # 询问的是预防措施，但因为提到了两种疾病，这里隐含的是对共同预防措施的询问
-**示例5：**
-输入："头疼是什么原因，应该怎么办？"
-输出：["查询疾病简介","查询疾病病因", "查询疾病的治疗方法"]  # 用户询问的是头疼的病因和治疗方法
-**示例6：**
-输入："如何知道自己是不是有艾滋病？"
-输出：["查询疾病简介","查询疾病所需检查项目","查询疾病病因"]  # 用户想知道自己是不是有艾滋病，一定一定要进行相关检查，这是根本性的！其次是查看疾病的病因，看看自己的行为是不是和病因重合。
-**示例7：**
-输入："我该怎么知道我自己是否得了21三体综合症呢？"
-输出：["查询疾病简介","查询疾病所需检查项目","查询疾病病因"]  # 用户想知道自己是不是有21三体综合症，一定一定要进行相关检查(比如染色体)，这是根本性的！其次是查看疾病的病因。
-**示例8：**
-输入："感冒了，怎么办？"
-输出：["查询疾病简介","查询疾病的治疗方法","查询疾病所需药品","查询疾病所需检查项目","查询疾病宜吃食物"]  # 问怎么办，首选治疗方法。然后是要给用户推荐一些药，最后让他检查一下身体。同时，也推荐一下食物。
-**示例9：**
-输入："癌症会引发其他疾病吗？"
-输出：["查询疾病简介","查询疾病的并发疾病","查询疾病简介"]  # 显然，用户问的是疾病并发疾病，随后可以给用户科普一下癌症简介。
-**示例10：**
-输入："葡萄糖浆的生产者是谁？葡萄糖浆是谁生产的？"
-输出：["查询药品的生产商"]  # 显然，用户想要问药品的生产商
-通过上述例子，我们希望你能够形成一套系统的思考过程，以准确识别出用户问题中的所有可能查询意图。请仔细分析用户的问题，考虑到其可能的多重含义，确保输出反映了所有相关的查询意图。
+要求：
+1. 只选择用户明确询问、且能够由上述知识图谱意图直接表达的类别。
+2. 不要因为出现疾病名称就自动增加“查询疾病简介”。
+3. 不要扩展用户没有询问的内容。
+4. 如果问题属于开放式解释、生活方式原因、个体化健康咨询，
+   而这些类别无法准确表达，则返回空列表。
+5. 最多返回 3 个意图。
+6. 只输出 JSON 对象，不要输出解释。
 
-**注意：**
-- 你的所有输出，都必须在这个范围内上述**查询类别**范围内，不可创造新的名词与类别！
-- 参考上述5个示例：在输出查询意图对应的列表之后，请紧跟着用"#"号开始的注释，简短地解释为什么选择这些意图选项。注释应当直接跟在列表后面，形成一条连续的输出。
-- 你的输出的类别数量不应该超过5，如果确实有很多个，请你输出最有可能的5个！同时，你的解释不宜过长，但是得富有条理性。
+用户问题：
+{query}
 
-现在，你已经知道如何解决问题了，请你解决下面这个问题并将结果输出！
-问题输入："{query}"
-输出的时候请确保输出内容都在**查询类别**中出现过。确保输出类别个数**不要超过5个**！确保你的解释和合乎逻辑的！注意，如果用户询问了有关疾病的问题，一般都要先介绍一下疾病，也就是有"查询疾病简介"这个需求。
-再次检查你的输出都包含在**查询类别**:"查询疾病简介"、"查询疾病病因"、"查询疾病预防措施"、"查询疾病治疗周期"、"查询治愈概率"、"查询疾病易感人群"、"查询疾病所需药品"、"查询疾病宜吃食物"、"查询疾病忌吃食物"、"查询疾病所需检查项目"、"查询疾病所属科目"、"查询疾病的症状"、"查询疾病的治疗方法"、"查询疾病的并发疾病"、"查询药品的生产商"。
-"""
-    rec_result = ollama.generate(model=choice, prompt=prompt)['response']
-    logger.debug('意图识别结果: %s', rec_result)
+输出格式：
+{{"intents": []}}
+""".strip()
+
+    try:
+        result = ollama.generate(
+            model=choice,
+            prompt=prompt,
+            format="json",
+            options={
+                "temperature": 0,
+                "seed": 42,
+            },
+        )
+
+        raw = result["response"]
+        data = json.loads(raw)
+        intents = data.get("intents", [])
+
+        if not isinstance(intents, list):
+            intents = []
+
+        valid_intents: List[str] = []
+        for intent in intents:
+            if (
+                intent in allowed_intents
+                and intent not in valid_intents
+            ):
+                valid_intents.append(intent)
+
+        rec_result = json.dumps(
+            valid_intents[:3],
+            ensure_ascii=False,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "结构化意图识别失败: %s",
+            exc,
+        )
+        rec_result = "[]"
+
+    logger.debug(
+        "LLM兜底意图识别结果: %s",
+        rec_result,
+    )
     return rec_result
-
 
 def add_shuxing_prompt(entity, shuxing, client):
     """[转发] 查询疾病属性并生成 ``<提示>...</提示>`` 文本。
@@ -163,43 +441,133 @@ def generate_prompt(
     tfidf_r,
     device,
     idx2tag,
-) -> Tuple[str, str, Dict[str, str]]:
-    """根据 LLM 意图识别输出与 NER 抽取结果，组装最终送给 LLM 的 prompt。
-
-    :return: ``(prompt, intents_str, entities)``；``intents_str`` 是「、」拼接的中文意图名。
+) -> Tuple[
+    str,
+    str,
+    Dict[str, str],
+    List[Evidence],
+]:
     """
-    entities = ner.get_ner_result(bert_model, bert_tokenizer, query, rule, tfidf_r, device, idx2tag)
-    # 统一封装为 KGClient（若调用方已传入 KGClient 则直接复用）
-    kg = client if isinstance(client, KGClient) else KGClient(client)
-    yitu: List[str] = []
-    prompt = "<指令>你是一个医疗问答机器人，你需要根据给定的提示回答用户的问题。请注意，你的全部回答必须完全基于给定的提示，不可自由发挥。如果根据提示无法给出答案，立刻回答“根据已知信息无法回答该问题”。</指令>"
-    prompt +="<指令>请你仅针对医疗类问题提供简洁和专业的回答。如果问题不是医疗相关的，你一定要回答“我只能回答医疗相关的问题。”，以明确告知你的回答限制。</指令>"
-    if '疾病症状' in entities and  '疾病' not in entities:
-        # 修复：原 client.run(...).data()[0] 在空结果时 IndexError
-        res = kg.get_diseases_by_symptom(entities['疾病症状'])
-        if len(res)>0:
-            entities['疾病'] = random.choice(res)
-            all_en = "、".join(res)
-            prompt+=f"<提示>用户有{entities['疾病症状']}的情况，知识库推测其可能是得了{all_en}。请注意这只是一个推测，你需要明确告知用户这一点。</提示>"
-    pre_len = len(prompt)
-    # 用表驱动的意图路由替换原本 16 个重复 if 块；
-    # intent_router 内部已修复「治疗周期 vs 治疗方法」子串误匹配 bug。
-    intent_prompt, intent_names = execute_intents(response, entities, kg)
-    prompt += intent_prompt
-    yitu.extend(intent_names)
-    if pre_len==len(prompt) :
-        prompt += f"<提示>提示：知识库异常，没有相关信息！请你直接回答“根据已知信息无法回答该问题”！</提示>"
-    prompt += f"<用户问题>{query}</用户问题>"
-    prompt += f"<注意>现在你已经知道给定的“<提示></提示>”和“<用户问题></用户问题>”了,你要极其认真的判断提示里是否有用户问题所需的信息，如果没有相关信息，你必须直接回答“根据已知信息无法回答该问题”。</注意>"
+    新版 RAG Prompt 生成。
 
-    prompt += f"<注意>你一定要再次检查你的回答是否完全基于“<提示></提示>”的内容，不可产生提示之外的答案！换而言之，你的任务是根据用户的问题，将“<提示></提示>”整理成有条理、有逻辑的语句。你起到的作用仅仅是整合提示的功能，你一定不可以利用自身已经存在的知识进行回答，你必须从提示中找到问题的答案！</注意>"
-    prompt += f"<注意>你必须充分的利用提示中的知识，不可将提示中的任何信息遗漏，你必须做到对提示信息的充分整合。你回答的任何一句话必须在提示中有所体现！如果根据提示无法给出答案，你必须回答“根据已知信息无法回答该问题”。<注意>"
-    
-    
-    logger.debug('prompt: %s', prompt)
-    return prompt,"、".join(yitu),entities
+    返回：
+        prompt
+        intents_str
+        entities
+        evidence_list
+    """
 
+    # --------------------------------------------------------------
+    # 1. NER
+    # --------------------------------------------------------------
 
+    entities = ner.get_ner_result(
+        bert_model,
+        bert_tokenizer,
+        query,
+        rule,
+        tfidf_r,
+        device,
+        idx2tag,
+    )
+
+    kg = (
+        client
+        if isinstance(client, KGClient)
+        else KGClient(client)
+    )
+
+    evidence_list: List[Evidence] = []
+
+    # --------------------------------------------------------------
+    # 2. 症状反查
+    #
+    # 旧代码这里会：
+    #
+    # random.choice(res)
+    #
+    # 随机挑一个疾病塞进 entities。
+    #
+    # 这个行为非常不适合医疗系统：
+    # 同一个症状可能对应很多疾病，不能随机选一个当成用户疾病。
+    # --------------------------------------------------------------
+
+    if (
+        "疾病症状" in entities
+        and "疾病" not in entities
+    ):
+
+        symptom = entities["疾病症状"]
+
+        diseases = kg.get_diseases_by_symptom(
+            symptom
+        )
+
+        if diseases:
+
+            evidence_list.append(
+                Evidence(
+                    source_type="kg",
+                    title="Neo4j 医疗知识图谱",
+                    entity=symptom,
+                    relation="疾病症状反向关联",
+                    content="、".join(diseases),
+                    note=(
+                        "这些疾病仅与该症状存在图谱关联，"
+                        "不能据此进行疾病诊断。"
+                    ),
+                )
+            )
+
+    # --------------------------------------------------------------
+    # 3. KG Intent Retrieval
+    # --------------------------------------------------------------
+
+    intent_names, kg_evidence = (
+        execute_intents_with_evidence(
+            response=response,
+            entities=entities,
+            kg=kg,
+        )
+    )
+
+    evidence_list.extend(
+        kg_evidence
+    )
+
+    # --------------------------------------------------------------
+    # 4. Evidence -> Grounded Prompt
+    # --------------------------------------------------------------
+
+    prompt = build_grounded_prompt(
+        query=query,
+        evidence_list=evidence_list,
+    )
+
+    logger.debug(
+        "entities: %s",
+        entities,
+    )
+
+    logger.debug(
+        "intents: %s",
+        intent_names,
+    )
+
+    logger.debug(
+        "evidence: %s",
+        [
+            e.to_dict()
+            for e in evidence_list
+        ],
+    )
+
+    return (
+        prompt,
+        "、".join(intent_names),
+        entities,
+        evidence_list,
+    )
 
 def ans_stream(prompt):
     """[已弃用] 旧版 ChatGLM 流式回答接口。
@@ -216,54 +584,94 @@ def ans_stream(prompt):
 
 def main(is_admin: bool, usname: str) -> None:
     """Streamlit 主界面入口；由 ``login.py`` 在用户登录成功后调用。"""
-    cache_model = settings.NER_CHECKPOINT
-    st.title(f"医疗智能问答机器人")
+    medical_agent = load_medical_agent()
 
+    cache_model = settings.NER_CHECKPOINT
+    st.title("医疗智能问答机器人")
+
+    # ==============================================================
+    # 1. Sidebar
+    # ==============================================================
     with st.sidebar:
-        col1, col2 = st.columns([0.6, 0.6])
+        col1, _ = st.columns([0.6, 0.6])
         with col1:
-            st.image(os.path.join("img", "logo.jpg"), use_container_width=True)
+            st.image(os.path.join("img", "logo.jpg"), use_column_width=True)
 
         st.caption(
             f"""<p align="left">欢迎您，{'管理员' if is_admin else '用户'}{usname}！当前版本：{1.0}</p>""",
             unsafe_allow_html=True,
         )
 
-        if 'chat_windows' not in st.session_state:
+        # 初始化对话窗口
+        if "chat_windows" not in st.session_state:
             st.session_state.chat_windows = [[]]
+
+        if "messages" not in st.session_state:
             st.session_state.messages = [[]]
 
-        if st.button('新建对话窗口'):
+        if st.button("新建对话窗口"):
             st.session_state.chat_windows.append([])
             st.session_state.messages.append([])
 
-        window_options = [f"对话窗口 {i + 1}" for i in range(len(st.session_state.chat_windows))]
-        selected_window = st.selectbox('请选择对话窗口:', window_options)
+        window_options = [
+            f"对话窗口 {i + 1}"
+            for i in range(len(st.session_state.chat_windows))
+        ]
+        selected_window = st.selectbox(
+            "请选择对话窗口:",
+            window_options,
+        )
         active_window_index = int(selected_window.split()[1]) - 1
 
         selected_option = st.selectbox(
-            label='请选择大语言模型:',
-            options=['Qwen 1.5', 'Llama2-Chinese']
+            label="请选择大语言模型:",
+            options=["Qwen 1.5", "Llama2-Chinese"],
         )
-        choice = settings.OLLAMA_QWEN_MODEL if selected_option == 'Qwen 1.5' else settings.OLLAMA_LLAMA_MODEL
 
-        show_ent = show_int = show_prompt = False
+        choice = (
+            settings.OLLAMA_QWEN_MODEL
+            if selected_option == "Qwen 1.5"
+            else settings.OLLAMA_LLAMA_MODEL
+        )
+
+        show_ent = False
+        show_int = False
+        show_prompt = False
+        show_evidence = False
+        show_route = False
+
         if is_admin:
-            show_ent = st.sidebar.checkbox("显示实体识别结果")
-            show_int = st.sidebar.checkbox("显示意图识别结果")
-            show_prompt = st.sidebar.checkbox("显示查询的知识库信息")
-            if st.button('修改知识图谱'):
-            # 显示一个链接，用户可以点击这个链接在新标签页中打开百度
-                st.markdown('[点击这里修改知识图谱](http://127.0.0.1:7474/)', unsafe_allow_html=True)
+            show_ent = st.checkbox("显示实体识别结果")
+            show_int = st.checkbox("显示意图识别结果")
+            show_prompt = st.checkbox("显示查询的知识库信息")
+            show_evidence = st.checkbox("显示结构化检索证据")
+            show_route = st.checkbox("显示检索路由")
 
-
+            if st.button("修改知识图谱"):
+                st.markdown(
+                    "[点击这里修改知识图谱](http://127.0.0.1:7474/)",
+                    unsafe_allow_html=True,
+                )
 
         if st.button("返回登录"):
             st.session_state.logged_in = False
             st.session_state.admin = False
             st.rerun()
 
-    glm_tokenizer, glm_model, bert_tokenizer, bert_model, idx2tag, rule, tfidf_r, device = load_model(cache_model)
+    # ==============================================================
+    # 2. 加载 NER 模型 + Neo4j
+    # ==============================================================
+    (
+        glm_tokenizer,
+        glm_model,
+        bert_tokenizer,
+        bert_model,
+        idx2tag,
+        rule,
+        tfidf_r,
+        device,
+    ) = load_model(cache_model)
+
     graph = py2neo.Graph(
         settings.NEO4J_URL,
         user=settings.NEO4J_USER,
@@ -272,58 +680,478 @@ def main(is_admin: bool, usname: str) -> None:
     )
     client = KGClient(graph)
 
+    # Vector RAG Retriever
+    vector_retriever = load_vector_retriever()
+
     current_messages = st.session_state.messages[active_window_index]
 
+    # ==============================================================
+    # 3. 回放历史消息
+    # ==============================================================
     for message in current_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-            if message["role"] == "assistant":
-                if show_ent:
-                    with st.expander("实体识别结果"):
-                        st.write(message.get("ent", ""))
-                if show_int:
-                    with st.expander("意图识别结果"):
-                        st.write(message.get("yitu", ""))
-                if show_prompt:
-                    with st.expander("点击显示知识库信息"):
-                        st.write(message.get("prompt", ""))
 
-    if query := st.chat_input("Ask me anything!", key=f"chat_input_{active_window_index}"):
-        current_messages.append({"role": "user", "content": query})
-        with st.chat_message("user"):
-            st.markdown(query)
+            if message["role"] != "assistant":
+                continue
 
-        response_placeholder = st.empty()
-        response_placeholder.text("正在进行意图识别...")
-
-        query = current_messages[-1]["content"]
-        response = Intent_Recognition(query, choice)
-        response_placeholder.empty()
-
-        prompt, yitu, entities = generate_prompt(response, query, client, bert_model, bert_tokenizer, rule, tfidf_r, device, idx2tag)
-
-        last = ""
-        for chunk in ollama.chat(model=choice, messages=[{'role': 'user', 'content': prompt}], stream=True):
-            last += chunk['message']['content']
-            response_placeholder.markdown(last)
-        response_placeholder.markdown("")
-
-        knowledge = re.findall(r'<提示>(.*?)</提示>', prompt)
-        zhishiku_content = "\n".join([f"提示{idx + 1}, {kn}" for idx, kn in enumerate(knowledge) if len(kn) >= 3])
-        with st.chat_message("assistant"):
-            st.markdown(last)
             if show_ent:
                 with st.expander("实体识别结果"):
-                    st.write(str(entities))
+                    st.write(message.get("ent", ""))
+
             if show_int:
                 with st.expander("意图识别结果"):
-                    st.write(yitu)
+                    st.write(message.get("yitu", ""))
+
             if show_prompt:
-                
-                
                 with st.expander("点击显示知识库信息"):
+                    prompt_text = message.get("prompt", "")
+                    if prompt_text:
+                        st.write(prompt_text)
+                    else:
+                        st.write("本轮没有有效知识库信息")
+
+            if show_evidence:
+                with st.expander("结构化检索证据"):
+                    evidence_data = message.get("evidence", [])
+                    if evidence_data:
+                        st.json(evidence_data)
+                    else:
+                        st.write("本轮没有有效检索证据")
+
+
+            if show_route:
+                with st.expander("检索路由"):
+                    st.write(
+                        "retrieval_mode:",
+                        message.get("retrieval_mode", ""),
+                    )
+                    st.write(
+                        "route_reason:",
+                        message.get("route_reason", ""),
+                    )
+                    st.write(
+                        "answer_mode:",
+                        message.get("answer_mode", ""),
+                    )
+
+    # ==============================================================
+    # 4. 接收当前问题
+    # ==============================================================
+    query = st.chat_input(
+        "Ask me anything!",
+        key=f"chat_input_{active_window_index}",
+    )
+
+    if not query:
+        return
+
+    # 保存并显示用户消息
+    current_messages.append(
+        {
+            "role": "user",
+            "content": query,
+        }
+    )
+
+    with st.chat_message("user"):
+        st.markdown(query)
+
+    # ==============================================================
+    # 5. 特殊多轮请求：“你的依据是什么？”
+    # ==============================================================
+    if is_source_query(query):
+        previous_turn = get_last_assistant_turn(
+            current_messages[:-1]
+        )
+
+        if previous_turn is None:
+            last = "当前对话中还没有可以追溯的上一轮回答。"
+            evidence_data = []
+        else:
+            evidence_data = previous_turn.get(
+                "evidence",
+                [],
+            )
+            last = format_evidence_answer(
+                evidence_data
+            )
+
+        with st.chat_message("assistant"):
+            st.markdown(last)
+
+            if show_evidence:
+                with st.expander("结构化检索证据"):
+                    if evidence_data:
+                        st.json(evidence_data)
+                    else:
+                        st.write("上一轮没有保存有效检索证据")
+
+        current_messages.append(
+            {
+                "role": "assistant",
+                "content": last,
+                "yitu": "证据追溯",
+                "prompt": "",
+                "ent": "",
+                "evidence": evidence_data,
+                "original_query": query,
+                "resolved_query": query,
+            }
+        )
+
+        st.session_state.messages[
+            active_window_index
+        ] = current_messages
+
+        return
+
+    # ==============================================================
+    # 6. 普通问题 / 多轮追问
+    # ==============================================================
+
+    # --------------------------------------------------------------
+    # 6.1 上下文改写
+    # --------------------------------------------------------------
+    with st.status(
+        "正在处理问题...",
+        expanded=False,
+    ) as status:
+        status.write("正在解析对话上下文...")
+
+        resolved_query = resolve_followup_query(
+            query=query,
+            messages=current_messages[:-1],
+            model=choice,
+        )
+
+        logger.info(
+            "原始问题: %s | 上下文改写: %s",
+            query,
+            resolved_query,
+        )
+
+        # ----------------------------------------------------------
+        # 6.2 Intent
+        # ----------------------------------------------------------
+        status.write("正在进行意图识别...")
+
+        response = Intent_Recognition(
+            resolved_query,
+            choice,
+        )
+
+        # ----------------------------------------------------------
+        # 6.3 Retrieval
+        # ----------------------------------------------------------
+        status.write("正在检索知识证据...")
+
+        (
+            prompt,
+            yitu,
+            entities,
+            evidence_list,
+        ) = generate_prompt(
+            response,
+            resolved_query,
+            client,
+            bert_model,
+            bert_tokenizer,
+            rule,
+            tfidf_r,
+            device,
+            idx2tag,
+        )
+
+        # 当前 generate_prompt() 返回的是 KG Evidence。
+        kg_evidence = list(evidence_list)
+
+        (
+            retrieval_mode,
+            route_reason,
+        ) = decide_retrieval_mode_v2(
+            resolved_query,
+            kg_evidence,
+        )
+
+        logger.info(
+            "Retrieval Route: %s | reason=%s",
+            retrieval_mode,
+            route_reason,
+        )
+
+        status.write(
+            f"检索路由: {retrieval_mode}"
+        )
+
+        vector_evidence: List[Evidence] = []
+
+        if retrieval_mode in {
+            "VECTOR",
+            "HYBRID",
+        }:
+            if vector_retriever is not None and vector_retriever.ready():
+                status.write(
+                    "正在执行医学文档向量检索..."
+                )
+
+                try:
+                    vector_evidence = (
+                        vector_retriever.search(
+                            resolved_query
+                        )
+                    )
+
+                except Exception as exc:
+                    logger.exception(
+                        "Vector Retrieval 失败: %s",
+                        exc,
+                    )
+                    vector_evidence = []
+
+            else:
+                logger.warning(
+                    "Vector collection 尚未构建，"
+                    "请先运行 build_vector_index.py"
+                )
+
+        # VECTOR 模式必须丢弃可能由错误 Intent 产生的 KG 证据。
+        if retrieval_mode == "VECTOR":
+            evidence_list = list(
+                vector_evidence
+            )
+
+        elif retrieval_mode == "HYBRID":
+            evidence_list = (
+                list(kg_evidence)
+                + list(vector_evidence)
+            )
+
+        else:
+            evidence_list = list(
+                kg_evidence
+            )
+
+        # KG + Vector 合并后重新构建 Grounded Prompt。
+        # 纯 KG 情况后面仍由 kg_answer_formatter 确定性回答；
+        # 只要存在 vector evidence，就会进入 LLM_GROUNDED。
+        prompt = build_grounded_prompt(
+            query=resolved_query,
+            evidence_list=evidence_list,
+        )
+
+        status.update(
+            label=(
+                f"检索完成（{retrieval_mode}），"
+                "正在生成回答..."
+            ),
+            state="complete",
+            expanded=False,
+        )
+
+    # ==============================================================
+    # 7. Answer Generation
+    #
+    # KG:
+    #   确定性 Formatter，不调用 Qwen。
+    #
+    # VECTOR / HYBRID:
+    #   必须真正命中 Vector Evidence 才允许 LLM 回答。
+    # ==============================================================
+    with st.chat_message("assistant"):
+        response_placeholder = st.empty()
+
+        if retrieval_mode == "KG":
+
+            if not kg_evidence:
+                answer_mode = "NO_EVIDENCE"
+                last = (
+                    "根据当前知识图谱证据无法回答该问题。"
+                )
+            else:
+                answer_mode = "KG_DETERMINISTIC"
+                last = format_kg_answer(
+                    kg_evidence
+                )
+
+            response_placeholder.markdown(
+                last
+            )
+
+        elif retrieval_mode in {
+            "VECTOR",
+            "HYBRID",
+        }:
+
+            if not vector_evidence:
+                answer_mode = "NO_VECTOR_EVIDENCE"
+                last = (
+                    "当前医学文档知识库没有检索到足够相关的证据，"
+                    "因此暂时无法基于可信文档完整回答该问题。"
+                )
+
+                response_placeholder.markdown(
+                    last
+                )
+
+            else:
+                answer_mode = "LLM_GROUNDED"
+                last = ""
+
+                try:
+                    for chunk in ollama.chat(
+                        model=choice,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": prompt,
+                            }
+                        ],
+                        stream=True,
+                        options={
+                            "temperature": 0.1,
+                            "seed": 42,
+                        },
+                    ):
+                        content = chunk[
+                            "message"
+                        ][
+                            "content"
+                        ]
+
+                        last += content
+
+                        response_placeholder.markdown(
+                            last
+                        )
+
+                except Exception as exc:
+                    logger.exception(
+                        "Ollama 回答生成失败: %s",
+                        exc,
+                    )
+
+                    answer_mode = "LLM_ERROR"
+
+                    last = (
+                        "回答生成失败，请检查 Ollama 服务和模型状态。"
+                    )
+
+                    response_placeholder.error(
+                        last
+                    )
+
+        else:
+            answer_mode = "NO_EVIDENCE"
+            last = (
+                "根据当前知识库证据无法回答该问题。"
+            )
+
+            response_placeholder.markdown(
+                last
+            )
+
+        # ----------------------------------------------------------
+        # 7.1 结构化 Evidence
+        # ----------------------------------------------------------
+        evidence_data = [
+            evidence.to_dict()
+            for evidence in evidence_list
+        ]
+
+        # 兼容旧版“知识库信息”面板
+        zhishiku_content = "\n\n".join(
+            evidence.to_prompt(index)
+            for index, evidence in enumerate(
+                evidence_list,
+                start=1,
+            )
+        )
+
+        # ----------------------------------------------------------
+        # 7.2 Debug 信息
+        # ----------------------------------------------------------
+        if show_ent:
+            with st.expander("实体识别结果"):
+                st.write(str(entities))
+
+        if show_int:
+            with st.expander("意图识别结果"):
+                st.write(yitu)
+
+        if show_prompt:
+            with st.expander("点击显示知识库信息"):
+                if zhishiku_content:
                     st.write(zhishiku_content)
-        current_messages.append({"role": "assistant", "content": last, "yitu": yitu, "prompt": zhishiku_content, "ent": str(entities)})
+                else:
+                    st.write("没有命中有效知识证据")
+
+        if show_evidence:
+            with st.expander("结构化检索证据"):
+                if evidence_data:
+                    st.json(evidence_data)
+                else:
+                    st.write("本轮没有有效检索证据")
 
 
-    st.session_state.messages[active_window_index] = current_messages
+        if show_route:
+            with st.expander("检索路由"):
+                st.write(
+                    "retrieval_mode:",
+                    retrieval_mode,
+                )
+                st.write(
+                    "route_reason:",
+                    route_reason,
+                )
+                st.write(
+                    "answer_mode:",
+                    answer_mode,
+                )
+                st.write(
+                    "KG Evidence 数:",
+                    len(kg_evidence),
+                )
+                st.write(
+                    "Vector Evidence 数:",
+                    len(vector_evidence),
+                )
+
+    # ==============================================================
+    # 8. 保存完整 Turn
+    # ==============================================================
+    current_messages.append(
+        {
+            "role": "assistant",
+            "content": last,
+
+            # 用户原始问题
+            "original_query": query,
+
+            # 上下文改写后的独立问题
+            "resolved_query": resolved_query,
+
+            # Pipeline 信息
+            "yitu": yitu,
+            "ent": str(entities),
+
+            # 兼容旧 UI
+            "prompt": zhishiku_content,
+
+            # 新版核心字段
+            "evidence": evidence_data,
+
+            # 回答模式：
+            # NO_EVIDENCE / KG_DETERMINISTIC / LLM_GROUNDED
+            "answer_mode": answer_mode,
+
+            # 检索路由：
+            # KG / VECTOR / HYBRID
+            "retrieval_mode": retrieval_mode,
+            "route_reason": route_reason,
+        }
+    )
+
+    st.session_state.messages[
+        active_window_index
+    ] = current_messages
