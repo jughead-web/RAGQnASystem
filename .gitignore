@@ -60,3 +60,21 @@ tests/
 # Test medical data
 case_memory/*.json
 semantic_memory/*.json
+# qdrant database
+qdrant_storage/
+
+# vector database
+*.sqlite
+
+# python cache
+__pycache__/
+
+# model
+model/
+
+# local data
+tmp_data/
+
+# user generated memory
+case_memory/
+semantic_memory/
