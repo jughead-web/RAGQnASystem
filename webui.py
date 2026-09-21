@@ -582,57 +582,476 @@ def ans_stream(prompt):
 
 
 
-def main(is_admin: bool, usname: str) -> None:
-    """Streamlit 主界面入口；由 ``login.py`` 在用户登录成功后调用。"""
-    medical_agent = load_medical_agent()
 
+# ======================================================================
+# Modern Streamlit UI
+# ======================================================================
+
+APP_CSS = """
+<style>
+:root {
+    --primary: #2563eb;
+    --primary-dark: #1d4ed8;
+    --cyan: #06b6d4;
+    --bg: #f5fafc;
+    --card: #ffffff;
+    --text: #172033;
+    --muted: #7d8999;
+    --line: #e4ebf3;
+}
+
+html, body, [class*="css"] {
+    font-family: "Microsoft YaHei", "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+}
+
+.stApp {
+    background:
+        radial-gradient(circle at 74% 9%, rgba(14,165,233,.055), transparent 25%),
+        linear-gradient(180deg, #f8fcfe 0%, #f4f9fc 100%);
+    color: var(--text);
+}
+
+.main .block-container {
+    max-width: 1120px;
+    padding-top: 1.2rem;
+    padding-bottom: 6rem;
+}
+
+[data-testid="stSidebar"] {
+    background: rgba(255,255,255,.97);
+    border-right: 1px solid #e5edf5;
+}
+
+[data-testid="stSidebar"] > div:first-child {
+    padding-top: 1.7rem;
+}
+
+#MainMenu, footer {
+    visibility: hidden;
+}
+
+header[data-testid="stHeader"] {
+    background: rgba(248,252,254,.80);
+    backdrop-filter: blur(9px);
+}
+
+/* 品牌 */
+.brand-wrap {
+    display:flex;
+    align-items:center;
+    gap:12px;
+    margin: 2px 0 22px;
+}
+.brand-icon {
+    width:44px;
+    height:44px;
+    border-radius:13px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:#fff;
+    font-size:23px;
+    background:linear-gradient(135deg,#2563eb 0%,#06b6d4 100%);
+    box-shadow:0 8px 18px rgba(37,99,235,.20);
+}
+.brand-name {
+    font-size:18px;
+    font-weight:760;
+    color:#182033;
+}
+.brand-sub {
+    font-size:12px;
+    color:#8b96a6;
+    margin-top:3px;
+}
+
+.side-section {
+    color:#9aa5b5;
+    font-size:12px;
+    margin: 12px 0 8px;
+}
+
+/* 顶部状态栏 */
+.top-assistant {
+    display:flex;
+    align-items:center;
+    gap:12px;
+    background:rgba(255,255,255,.86);
+    border:1px solid #e8eef5;
+    border-radius:14px;
+    padding:12px 16px;
+    margin-bottom:20px;
+}
+.top-avatar {
+    width:40px;
+    height:40px;
+    border-radius:12px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:#e0f2fe;
+    color:#2563eb;
+    font-size:20px;
+}
+.top-name {
+    font-weight:760;
+    color:#1f2937;
+    font-size:16px;
+}
+.online-dot {
+    display:inline-block;
+    width:8px;
+    height:8px;
+    border-radius:50%;
+    background:#22c55e;
+    margin-right:6px;
+}
+.top-status {
+    color:#7b8798;
+    font-size:12px;
+    margin-top:2px;
+}
+
+/* 欢迎区 */
+.welcome-shell {
+    text-align:center;
+    padding:42px 10px 14px;
+}
+.welcome-icon {
+    width:78px;
+    height:78px;
+    margin:0 auto 18px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    border-radius:23px;
+    color:#2563eb;
+    background:linear-gradient(145deg,#dff4ff,#dbeafe);
+    box-shadow:0 14px 30px rgba(37,99,235,.11);
+    font-size:38px;
+}
+.welcome-title {
+    font-size:27px;
+    color:#1687bd;
+    font-weight:760;
+    margin-bottom:10px;
+}
+.welcome-subtitle {
+    max-width:650px;
+    margin:0 auto;
+    color:#7b8798;
+    font-size:14px;
+    line-height:1.9;
+}
+
+.cap-card {
+    background:#fff;
+    border:1px solid #e5edf5;
+    border-radius:14px;
+    padding:18px 18px 16px;
+    min-height:138px;
+    box-shadow:0 8px 20px rgba(28,60,105,.035);
+}
+.cap-icon {
+    width:36px;
+    height:36px;
+    border-radius:10px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:#e8f6ff;
+    color:#2563eb;
+    font-size:18px;
+    margin-bottom:12px;
+}
+.cap-title {
+    font-size:16px;
+    font-weight:740;
+    color:#263244;
+    margin-bottom:6px;
+}
+.cap-text {
+    color:#8290a2;
+    font-size:13px;
+    line-height:1.65;
+}
+
+/* chat */
+[data-testid="stChatMessage"] {
+    background:#fff;
+    border:1px solid #e7edf4;
+    border-radius:15px;
+    padding:10px 14px;
+    margin-bottom:11px;
+    box-shadow:0 4px 14px rgba(36,60,90,.025);
+}
+
+[data-testid="stChatInput"] {
+    border-radius:14px;
+}
+
+[data-testid="stChatInput"] > div {
+    background:#fff;
+    border:1px solid #dce6f0;
+    border-radius:14px;
+    box-shadow:0 8px 25px rgba(31,65,114,.075);
+}
+
+/* 信息标签 */
+.route-row {
+    margin:12px 0 4px;
+}
+.metric-chip {
+    display:inline-block;
+    padding:6px 10px;
+    margin:0 6px 6px 0;
+    background:#f8fbff;
+    border:1px solid #dfeaf5;
+    border-radius:999px;
+    color:#506073;
+    font-size:12px;
+}
+.metric-chip strong {
+    color:#1f5fbf;
+}
+
+/* 普通按钮 */
+.stButton > button {
+    border-radius:10px;
+    border:1px solid #dce6f0;
+    min-height:40px;
+}
+
+.stButton > button:hover {
+    border-color:#93c5fd;
+    color:#1d4ed8;
+}
+
+.sidebar-user {
+    background:#f4f8fc;
+    border:1px solid #e5edf5;
+    border-radius:12px;
+    padding:10px 12px;
+    color:#596678;
+    font-size:13px;
+    margin-top:12px;
+}
+
+.disclaimer {
+    text-align:center;
+    color:#a0aaba;
+    font-size:11px;
+    margin-top:8px;
+}
+</style>
+"""
+
+
+def _evidence_source_counts(evidence_data):
+    kg_count = 0
+    vector_count = 0
+    for item in evidence_data or []:
+        source_type = str(item.get("source_type", "")).lower()
+        if "kg" in source_type or "neo4j" in source_type:
+            kg_count += 1
+        elif "vector" in source_type or "document" in source_type:
+            vector_count += 1
+    return kg_count, vector_count
+
+
+def _render_route_summary(
+    retrieval_mode: str,
+    answer_mode: str,
+    evidence_data,
+) -> None:
+    kg_count, vector_count = _evidence_source_counts(evidence_data)
+    st.markdown(
+        f"""
+        <div class="route-row">
+            <span class="metric-chip">🔀 检索模式 <strong>{retrieval_mode or "-"}</strong></span>
+            <span class="metric-chip">🕸 KG Evidence <strong>{kg_count}</strong></span>
+            <span class="metric-chip">📄 Vector Evidence <strong>{vector_count}</strong></span>
+            <span class="metric-chip">🤖 Answer Mode <strong>{answer_mode or "-"}</strong></span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_evidence_list(evidence_data) -> None:
+    if not evidence_data:
+        st.caption("当前回答没有可展示的检索证据。")
+        return
+
+    for index, item in enumerate(evidence_data, start=1):
+        source = item.get("source_type") or "unknown"
+        title = item.get("title") or "未命名来源"
+        content = item.get("content") or ""
+        relation = item.get("relation")
+        entity = item.get("entity")
+        page = item.get("page")
+        score = item.get("score")
+        note = item.get("note")
+
+        st.markdown(f"**Evidence {index} · `{source}`**")
+        st.caption(title)
+
+        meta = []
+        if entity:
+            meta.append(f"实体：{entity}")
+        if relation:
+            meta.append(f"关系/字段：{relation}")
+        if page not in (None, ""):
+            meta.append(f"页码：{page}")
+        if isinstance(score, (int, float)):
+            meta.append(f"Score：{score:.4f}")
+        elif score not in (None, ""):
+            meta.append(f"Score：{score}")
+
+        if meta:
+            st.caption(" · ".join(meta))
+
+        st.info(content if content else "（无正文内容）")
+        if note:
+            st.caption(f"备注：{note}")
+
+        if index != len(evidence_data):
+            st.divider()
+
+
+def _render_welcome() -> str | None:
+    st.markdown(
+        """
+        <div class="welcome-shell">
+            <div class="welcome-icon">⚕</div>
+            <div class="welcome-title">您好，我是 MedEvidence AI</div>
+            <div class="welcome-subtitle">
+                面向医疗知识场景的多源 RAG 助手。系统会根据问题自动选择
+                Knowledge Graph、Vector Retrieval 或 Hybrid Retrieval，
+                并尽可能展示回答依据。
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(
+            """
+            <div class="cap-card">
+                <div class="cap-icon">🕸</div>
+                <div class="cap-title">知识图谱问答</div>
+                <div class="cap-text">面向疾病、症状、药物、检查等结构化医学关系进行精确查询。</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            """
+            <div class="cap-card">
+                <div class="cap-icon">📄</div>
+                <div class="cap-title">医学文档检索</div>
+                <div class="cap-text">基于 Qdrant 向量检索与 Reranker，从医学文档中召回相关证据。</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.markdown(
+            """
+            <div class="cap-card">
+                <div class="cap-icon">🔀</div>
+                <div class="cap-title">多源智能路由</div>
+                <div class="cap-text">根据问题自动选择 KG、Vector 或 Hybrid 路径，并进行 Evidence Grounding。</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("#### 可以试试这些问题")
+    q1, q2, q3 = st.columns(3)
+    quick_query = None
+    with q1:
+        if st.button("高血压有哪些症状？", use_container_width=True):
+            quick_query = "高血压有哪些症状？"
+    with q2:
+        if st.button("为什么高血压需要长期管理？", use_container_width=True):
+            quick_query = "为什么高血压需要长期管理？"
+    with q3:
+        if st.button("高血压有哪些症状，日常如何管理？", use_container_width=True):
+            quick_query = "高血压有哪些症状，日常如何管理？"
+
+    return quick_query
+
+
+def main(is_admin: bool, usname: str) -> None:
+    """Streamlit 主界面入口；保持原有 RAG 主链，仅重构展示层。"""
+
+    # 当前 MedicalAgent/Memory 为扩展模块，未进入 Web 主问答链。
+    # 不在这里提前初始化，避免与主 VectorRetriever 重复占用同一本地 Qdrant storage。
     cache_model = settings.NER_CHECKPOINT
-    st.title("医疗智能问答机器人")
+
+    st.markdown(APP_CSS, unsafe_allow_html=True)
 
     # ==============================================================
     # 1. Sidebar
     # ==============================================================
-    with st.sidebar:
-        col1, _ = st.columns([0.6, 0.6])
-        with col1:
-            st.image(os.path.join("img", "logo.jpg"), use_column_width=True)
+    if "chat_windows" not in st.session_state:
+        st.session_state.chat_windows = [[]]
+    if "messages" not in st.session_state:
+        st.session_state.messages = [[]]
 
-        st.caption(
-            f"""<p align="left">欢迎您，{'管理员' if is_admin else '用户'}{usname}！当前版本：{1.0}</p>""",
+    with st.sidebar:
+        st.markdown(
+            """
+            <div class="brand-wrap">
+                <div class="brand-icon">⚕</div>
+                <div>
+                    <div class="brand-name">MedEvidence AI</div>
+                    <div class="brand-sub">医疗知识智能助手</div>
+                </div>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
 
-        # 初始化对话窗口
-        if "chat_windows" not in st.session_state:
-            st.session_state.chat_windows = [[]]
+        st.markdown('<div class="side-section">工作区</div>', unsafe_allow_html=True)
 
-        if "messages" not in st.session_state:
-            st.session_state.messages = [[]]
-
-        if st.button("新建对话窗口"):
+        if st.button("✚  新建会话", use_container_width=True):
             st.session_state.chat_windows.append([])
             st.session_state.messages.append([])
+            st.rerun()
 
         window_options = [
-            f"对话窗口 {i + 1}"
+            f"会话 {i + 1}"
             for i in range(len(st.session_state.chat_windows))
         ]
         selected_window = st.selectbox(
-            "请选择对话窗口:",
+            "会话记录",
             window_options,
+            label_visibility="collapsed",
         )
         active_window_index = int(selected_window.split()[1]) - 1
 
+        st.markdown('<div class="side-section">模型</div>', unsafe_allow_html=True)
         selected_option = st.selectbox(
-            label="请选择大语言模型:",
-            options=["Qwen 1.5", "Llama2-Chinese"],
+            "生成模型",
+            ["Qwen 1.5", "Llama2-Chinese"],
+            label_visibility="collapsed",
         )
-
         choice = (
             settings.OLLAMA_QWEN_MODEL
             if selected_option == "Qwen 1.5"
             else settings.OLLAMA_LLAMA_MODEL
         )
+
+        st.markdown('<div class="side-section">知识能力</div>', unsafe_allow_html=True)
+        st.caption("🕸  Neo4j Knowledge Graph")
+        st.caption("📄  Qdrant Vector Retrieval")
+        st.caption("🎯  Cross Encoder Reranker")
+        st.caption("🧾  Evidence Grounding")
 
         show_ent = False
         show_int = False
@@ -641,25 +1060,56 @@ def main(is_admin: bool, usname: str) -> None:
         show_route = False
 
         if is_admin:
-            show_ent = st.checkbox("显示实体识别结果")
-            show_int = st.checkbox("显示意图识别结果")
-            show_prompt = st.checkbox("显示查询的知识库信息")
-            show_evidence = st.checkbox("显示结构化检索证据")
-            show_route = st.checkbox("显示检索路由")
-
-            if st.button("修改知识图谱"):
+            with st.expander("🛠 管理员调试面板"):
+                show_ent = st.checkbox("实体识别结果")
+                show_int = st.checkbox("意图识别结果")
+                show_prompt = st.checkbox("知识库上下文")
+                show_evidence = st.checkbox("结构化 Evidence JSON")
+                show_route = st.checkbox("检索路由详情")
                 st.markdown(
-                    "[点击这里修改知识图谱](http://127.0.0.1:7474/)",
-                    unsafe_allow_html=True,
+                    "[打开 Neo4j Browser](http://127.0.0.1:7474/)"
                 )
 
-        if st.button("返回登录"):
+        st.markdown("---")
+        st.markdown(
+            f"""
+            <div class="sidebar-user">
+                👤 <b>{usname}</b><br>
+                <span style="color:#8b96a6;font-size:12px;">
+                {'管理员' if is_admin else '普通用户'}
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if st.button("↪ 退出登录", use_container_width=True):
             st.session_state.logged_in = False
             st.session_state.admin = False
+            st.session_state.usname = ""
             st.rerun()
 
     # ==============================================================
-    # 2. 加载 NER 模型 + Neo4j
+    # 2. 顶部助手状态
+    # ==============================================================
+    st.markdown(
+        """
+        <div class="top-assistant">
+            <div class="top-avatar">⚕</div>
+            <div>
+                <div class="top-name">MedEvidence AI · 医疗知识智能助手</div>
+                <div class="top-status">
+                    <span class="online-dot"></span>
+                    在线 · KG / Vector / Hybrid 多源检索
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ==============================================================
+    # 3. 加载模型 + 数据库
     # ==============================================================
     (
         glm_tokenizer,
@@ -680,13 +1130,19 @@ def main(is_admin: bool, usname: str) -> None:
     )
     client = KGClient(graph)
 
-    # Vector RAG Retriever
     vector_retriever = load_vector_retriever()
 
     current_messages = st.session_state.messages[active_window_index]
 
     # ==============================================================
-    # 3. 回放历史消息
+    # 4. 欢迎页
+    # ==============================================================
+    quick_query = None
+    if not current_messages:
+        quick_query = _render_welcome()
+
+    # ==============================================================
+    # 5. 回放历史消息
     # ==============================================================
     for message in current_messages:
         with st.chat_message(message["role"]):
@@ -694,6 +1150,31 @@ def main(is_admin: bool, usname: str) -> None:
 
             if message["role"] != "assistant":
                 continue
+
+            evidence_data = message.get("evidence", [])
+            _render_route_summary(
+                message.get("retrieval_mode", ""),
+                message.get("answer_mode", ""),
+                evidence_data,
+            )
+
+            if evidence_data:
+                with st.expander(
+                    f"📚 查看回答依据（{len(evidence_data)} 条 Evidence）"
+                ):
+                    _render_evidence_list(evidence_data)
+
+            if message.get("route_reason"):
+                with st.expander("🔀 查看检索路由"):
+                    st.markdown(
+                        f"**Retrieval Mode：** `{message.get('retrieval_mode', '')}`"
+                    )
+                    st.markdown(
+                        f"**Route Reason：** {message.get('route_reason', '')}"
+                    )
+                    st.markdown(
+                        f"**Answer Mode：** `{message.get('answer_mode', '')}`"
+                    )
 
             if show_ent:
                 with st.expander("实体识别结果"):
@@ -704,49 +1185,36 @@ def main(is_admin: bool, usname: str) -> None:
                     st.write(message.get("yitu", ""))
 
             if show_prompt:
-                with st.expander("点击显示知识库信息"):
-                    prompt_text = message.get("prompt", "")
-                    if prompt_text:
-                        st.write(prompt_text)
-                    else:
-                        st.write("本轮没有有效知识库信息")
+                with st.expander("知识库上下文"):
+                    st.write(message.get("prompt", "") or "本轮没有有效知识库信息")
 
             if show_evidence:
-                with st.expander("结构化检索证据"):
-                    evidence_data = message.get("evidence", [])
-                    if evidence_data:
-                        st.json(evidence_data)
-                    else:
-                        st.write("本轮没有有效检索证据")
-
+                with st.expander("Evidence JSON"):
+                    st.json(evidence_data or [])
 
             if show_route:
-                with st.expander("检索路由"):
-                    st.write(
-                        "retrieval_mode:",
-                        message.get("retrieval_mode", ""),
-                    )
-                    st.write(
-                        "route_reason:",
-                        message.get("route_reason", ""),
-                    )
-                    st.write(
-                        "answer_mode:",
-                        message.get("answer_mode", ""),
-                    )
+                with st.expander("管理员路由详情"):
+                    st.write("retrieval_mode:", message.get("retrieval_mode", ""))
+                    st.write("route_reason:", message.get("route_reason", ""))
+                    st.write("answer_mode:", message.get("answer_mode", ""))
 
     # ==============================================================
-    # 4. 接收当前问题
+    # 6. 接收当前问题
     # ==============================================================
-    query = st.chat_input(
-        "Ask me anything!",
+    input_query = st.chat_input(
+        "请描述您的医疗知识问题，例如：高血压为什么需要长期管理？",
         key=f"chat_input_{active_window_index}",
+    )
+    query = quick_query or input_query
+
+    st.markdown(
+        '<div class="disclaimer">AI 生成内容仅用于知识参考，不替代专业医疗诊断与治疗建议。</div>',
+        unsafe_allow_html=True,
     )
 
     if not query:
         return
 
-    # 保存并显示用户消息
     current_messages.append(
         {
             "role": "user",
@@ -758,7 +1226,7 @@ def main(is_admin: bool, usname: str) -> None:
         st.markdown(query)
 
     # ==============================================================
-    # 5. 特殊多轮请求：“你的依据是什么？”
+    # 7. 特殊多轮请求：“你的依据是什么？”
     # ==============================================================
     if is_source_query(query):
         previous_turn = get_last_assistant_turn(
@@ -769,23 +1237,16 @@ def main(is_admin: bool, usname: str) -> None:
             last = "当前对话中还没有可以追溯的上一轮回答。"
             evidence_data = []
         else:
-            evidence_data = previous_turn.get(
-                "evidence",
-                [],
-            )
-            last = format_evidence_answer(
-                evidence_data
-            )
+            evidence_data = previous_turn.get("evidence", [])
+            last = format_evidence_answer(evidence_data)
 
         with st.chat_message("assistant"):
             st.markdown(last)
-
-            if show_evidence:
-                with st.expander("结构化检索证据"):
-                    if evidence_data:
-                        st.json(evidence_data)
-                    else:
-                        st.write("上一轮没有保存有效检索证据")
+            if evidence_data:
+                with st.expander(
+                    f"📚 上一轮回答依据（{len(evidence_data)} 条 Evidence）"
+                ):
+                    _render_evidence_list(evidence_data)
 
         current_messages.append(
             {
@@ -797,27 +1258,23 @@ def main(is_admin: bool, usname: str) -> None:
                 "evidence": evidence_data,
                 "original_query": query,
                 "resolved_query": query,
+                "answer_mode": "EVIDENCE_TRACE",
+                "retrieval_mode": "TRACE",
+                "route_reason": "用户请求追溯上一轮回答依据",
             }
         )
 
-        st.session_state.messages[
-            active_window_index
-        ] = current_messages
-
+        st.session_state.messages[active_window_index] = current_messages
         return
 
     # ==============================================================
-    # 6. 普通问题 / 多轮追问
+    # 8. 普通问题 / 多轮追问
     # ==============================================================
-
-    # --------------------------------------------------------------
-    # 6.1 上下文改写
-    # --------------------------------------------------------------
     with st.status(
-        "正在处理问题...",
+        "正在进行多源知识检索...",
         expanded=False,
     ) as status:
-        status.write("正在解析对话上下文...")
+        status.write("1/4 正在解析对话上下文...")
 
         resolved_query = resolve_followup_query(
             query=query,
@@ -831,20 +1288,14 @@ def main(is_admin: bool, usname: str) -> None:
             resolved_query,
         )
 
-        # ----------------------------------------------------------
-        # 6.2 Intent
-        # ----------------------------------------------------------
-        status.write("正在进行意图识别...")
+        status.write("2/4 正在进行意图识别与实体抽取...")
 
         response = Intent_Recognition(
             resolved_query,
             choice,
         )
 
-        # ----------------------------------------------------------
-        # 6.3 Retrieval
-        # ----------------------------------------------------------
-        status.write("正在检索知识证据...")
+        status.write("3/4 正在检索知识图谱证据...")
 
         (
             prompt,
@@ -863,7 +1314,6 @@ def main(is_admin: bool, usname: str) -> None:
             idx2tag,
         )
 
-        # 当前 generate_prompt() 返回的是 KG Evidence。
         kg_evidence = list(evidence_list)
 
         (
@@ -881,123 +1331,73 @@ def main(is_admin: bool, usname: str) -> None:
         )
 
         status.write(
-            f"检索路由: {retrieval_mode}"
+            f"4/4 路由到 {retrieval_mode}，正在补充检索证据..."
         )
 
         vector_evidence: List[Evidence] = []
 
-        if retrieval_mode in {
-            "VECTOR",
-            "HYBRID",
-        }:
+        if retrieval_mode in {"VECTOR", "HYBRID"}:
             if vector_retriever is not None and vector_retriever.ready():
-                status.write(
-                    "正在执行医学文档向量检索..."
-                )
-
                 try:
-                    vector_evidence = (
-                        vector_retriever.search(
-                            resolved_query
-                        )
+                    vector_evidence = vector_retriever.search(
+                        resolved_query
                     )
-
                 except Exception as exc:
                     logger.exception(
                         "Vector Retrieval 失败: %s",
                         exc,
                     )
                     vector_evidence = []
-
             else:
                 logger.warning(
                     "Vector collection 尚未构建，"
                     "请先运行 build_vector_index.py"
                 )
 
-        # VECTOR 模式必须丢弃可能由错误 Intent 产生的 KG 证据。
         if retrieval_mode == "VECTOR":
-            evidence_list = list(
-                vector_evidence
-            )
-
+            evidence_list = list(vector_evidence)
         elif retrieval_mode == "HYBRID":
-            evidence_list = (
-                list(kg_evidence)
-                + list(vector_evidence)
-            )
-
+            evidence_list = list(kg_evidence) + list(vector_evidence)
         else:
-            evidence_list = list(
-                kg_evidence
-            )
+            evidence_list = list(kg_evidence)
 
-        # KG + Vector 合并后重新构建 Grounded Prompt。
-        # 纯 KG 情况后面仍由 kg_answer_formatter 确定性回答；
-        # 只要存在 vector evidence，就会进入 LLM_GROUNDED。
         prompt = build_grounded_prompt(
             query=resolved_query,
             evidence_list=evidence_list,
         )
 
         status.update(
-            label=(
-                f"检索完成（{retrieval_mode}），"
-                "正在生成回答..."
-            ),
+            label=f"检索完成 · {retrieval_mode}",
             state="complete",
             expanded=False,
         )
 
     # ==============================================================
-    # 7. Answer Generation
-    #
-    # KG:
-    #   确定性 Formatter，不调用 Qwen。
-    #
-    # VECTOR / HYBRID:
-    #   必须真正命中 Vector Evidence 才允许 LLM 回答。
+    # 9. Answer Generation
     # ==============================================================
     with st.chat_message("assistant"):
         response_placeholder = st.empty()
 
         if retrieval_mode == "KG":
-
             if not kg_evidence:
                 answer_mode = "NO_EVIDENCE"
-                last = (
-                    "根据当前知识图谱证据无法回答该问题。"
-                )
+                last = "根据当前知识图谱证据无法回答该问题。"
             else:
                 answer_mode = "KG_DETERMINISTIC"
-                last = format_kg_answer(
-                    kg_evidence
-                )
+                last = format_kg_answer(kg_evidence)
+            response_placeholder.markdown(last)
 
-            response_placeholder.markdown(
-                last
-            )
-
-        elif retrieval_mode in {
-            "VECTOR",
-            "HYBRID",
-        }:
-
+        elif retrieval_mode in {"VECTOR", "HYBRID"}:
             if not vector_evidence:
                 answer_mode = "NO_VECTOR_EVIDENCE"
                 last = (
                     "当前医学文档知识库没有检索到足够相关的证据，"
                     "因此暂时无法基于可信文档完整回答该问题。"
                 )
-
-                response_placeholder.markdown(
-                    last
-                )
-
+                response_placeholder.markdown(last)
             else:
                 answer_mode = "LLM_GROUNDED"
                 last = ""
-
                 try:
                     for chunk in ollama.chat(
                         model=choice,
@@ -1013,53 +1413,29 @@ def main(is_admin: bool, usname: str) -> None:
                             "seed": 42,
                         },
                     ):
-                        content = chunk[
-                            "message"
-                        ][
-                            "content"
-                        ]
-
+                        content = chunk["message"]["content"]
                         last += content
-
-                        response_placeholder.markdown(
-                            last
-                        )
+                        response_placeholder.markdown(last)
 
                 except Exception as exc:
                     logger.exception(
                         "Ollama 回答生成失败: %s",
                         exc,
                     )
-
                     answer_mode = "LLM_ERROR"
-
-                    last = (
-                        "回答生成失败，请检查 Ollama 服务和模型状态。"
-                    )
-
-                    response_placeholder.error(
-                        last
-                    )
+                    last = "回答生成失败，请检查 Ollama 服务和模型状态。"
+                    response_placeholder.error(last)
 
         else:
             answer_mode = "NO_EVIDENCE"
-            last = (
-                "根据当前知识库证据无法回答该问题。"
-            )
+            last = "根据当前知识库证据无法回答该问题。"
+            response_placeholder.markdown(last)
 
-            response_placeholder.markdown(
-                last
-            )
-
-        # ----------------------------------------------------------
-        # 7.1 结构化 Evidence
-        # ----------------------------------------------------------
         evidence_data = [
             evidence.to_dict()
             for evidence in evidence_list
         ]
 
-        # 兼容旧版“知识库信息”面板
         zhishiku_content = "\n\n".join(
             evidence.to_prompt(index)
             for index, evidence in enumerate(
@@ -1068,9 +1444,35 @@ def main(is_admin: bool, usname: str) -> None:
             )
         )
 
-        # ----------------------------------------------------------
-        # 7.2 Debug 信息
-        # ----------------------------------------------------------
+        # 面向普通用户直接展示“可解释检索”能力
+        _render_route_summary(
+            retrieval_mode,
+            answer_mode,
+            evidence_data,
+        )
+
+        if evidence_data:
+            with st.expander(
+                f"📚 查看回答依据（{len(evidence_data)} 条 Evidence）"
+            ):
+                _render_evidence_list(evidence_data)
+
+        with st.expander("🔀 查看本轮检索路由"):
+            st.markdown(
+                f"**Retrieval Mode：** `{retrieval_mode}`"
+            )
+            st.markdown(
+                f"**Route Reason：** {route_reason}"
+            )
+            st.markdown(
+                f"**Answer Mode：** `{answer_mode}`"
+            )
+            st.caption(
+                f"KG Evidence：{len(kg_evidence)} · "
+                f"Vector Evidence：{len(vector_evidence)}"
+            )
+
+        # 管理员调试信息
         if show_ent:
             with st.expander("实体识别结果"):
                 st.write(str(entities))
@@ -1080,78 +1482,42 @@ def main(is_admin: bool, usname: str) -> None:
                 st.write(yitu)
 
         if show_prompt:
-            with st.expander("点击显示知识库信息"):
-                if zhishiku_content:
-                    st.write(zhishiku_content)
-                else:
-                    st.write("没有命中有效知识证据")
+            with st.expander("知识库上下文"):
+                st.write(
+                    zhishiku_content
+                    if zhishiku_content
+                    else "没有命中有效知识证据"
+                )
 
         if show_evidence:
-            with st.expander("结构化检索证据"):
-                if evidence_data:
-                    st.json(evidence_data)
-                else:
-                    st.write("本轮没有有效检索证据")
-
+            with st.expander("Evidence JSON"):
+                st.json(evidence_data or [])
 
         if show_route:
-            with st.expander("检索路由"):
-                st.write(
-                    "retrieval_mode:",
-                    retrieval_mode,
-                )
-                st.write(
-                    "route_reason:",
-                    route_reason,
-                )
-                st.write(
-                    "answer_mode:",
-                    answer_mode,
-                )
-                st.write(
-                    "KG Evidence 数:",
-                    len(kg_evidence),
-                )
-                st.write(
-                    "Vector Evidence 数:",
-                    len(vector_evidence),
-                )
+            with st.expander("管理员路由详情"):
+                st.write("retrieval_mode:", retrieval_mode)
+                st.write("route_reason:", route_reason)
+                st.write("answer_mode:", answer_mode)
+                st.write("KG Evidence 数:", len(kg_evidence))
+                st.write("Vector Evidence 数:", len(vector_evidence))
 
     # ==============================================================
-    # 8. 保存完整 Turn
+    # 10. 保存完整 Turn
     # ==============================================================
     current_messages.append(
         {
             "role": "assistant",
             "content": last,
-
-            # 用户原始问题
             "original_query": query,
-
-            # 上下文改写后的独立问题
             "resolved_query": resolved_query,
-
-            # Pipeline 信息
             "yitu": yitu,
             "ent": str(entities),
-
-            # 兼容旧 UI
             "prompt": zhishiku_content,
-
-            # 新版核心字段
             "evidence": evidence_data,
-
-            # 回答模式：
-            # NO_EVIDENCE / KG_DETERMINISTIC / LLM_GROUNDED
             "answer_mode": answer_mode,
-
-            # 检索路由：
-            # KG / VECTOR / HYBRID
             "retrieval_mode": retrieval_mode,
             "route_reason": route_reason,
         }
     )
 
-    st.session_state.messages[
-        active_window_index
-    ] = current_messages
+    st.session_state.messages[active_window_index] = current_messages
